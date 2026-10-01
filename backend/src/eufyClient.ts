@@ -6,6 +6,8 @@ import {
   LoginOptions,
   DatabaseReturnCode,
   DatabaseQueryLocal,
+  CommandName,
+  ErrorCode,
 } from "eufy-security-client";
 import { Readable } from "stream";
 import { spawn, ChildProcess } from "child_process";
@@ -58,7 +60,41 @@ export interface CaptchaInfo {
   imageBase64: string;
 }
 
-const LOCAL_QUERY_TIMEOUT_MS = 30_000;
+const LOCAL_QUERY_TIMEOUT_MS = 60_000;
+
+interface StationCommandResult {
+  command_type: number;
+  return_code: number;
+  customData?: { command?: { name?: string } };
+}
+
+/**
+ * Turn the eufy P2P layer's failure codes into something actionable.
+ *
+ * The library reports send/result failures on the generic "station command
+ * result" channel, which previously surfaced to users as a bare
+ * "Local database query timed out". These two codes distinguish the two very
+ * different situations that look identical from the outside.
+ */
+function describeLocalQueryFailure(returnCode: number): string {
+  switch (returnCode) {
+    case ErrorCode.ERROR_COMMAND_TIMEOUT:
+      return (
+        "Local database query failed: the HomeBase acknowledged the command but " +
+        "never returned results. Its local database is likely still initialising, " +
+        "or the selected date range is too wide for it to scan."
+      );
+    case ErrorCode.ERROR_CONNECT_TIMEOUT:
+      return (
+        "Local database query failed: the command was never sent because another " +
+        "P2P command was still in flight, so the query aged out of the send queue."
+      );
+    default:
+      return `Local database query failed (code: ${returnCode}, ${
+        ErrorCode[returnCode] ?? "unknown"
+      })`;
+  }
+}
 
 export class EufyService {
   private client: EufySecurity | null = null;
@@ -300,6 +336,26 @@ export class EufyService {
     const stationSN = device.getStationSerial();
     const deviceName = device.getName();
 
+    // Standalone cameras (eufyCam / SoloCam, incl. T8410) are their own station
+    // and answer CMD_DATABASE_QUERY_LOCAL with an ACK but never deliver the
+    // result event — the P2P session is torn down first. Upstream tracks this as
+    // eufy-security-ws#545 and closed it "not planned", so no fix is coming in
+    // the library. Attempting it here just burns the full timeout before failing,
+    // so bail out immediately with something actionable instead.
+    if (Device.isIntegratedDeviceBySn(stationSN)) {
+      logger.warn(
+        { stationSN, deviceSN: deviceSerialNumber },
+        "Skipping local P2P database query: standalone camera does not support it"
+      );
+      throw new Error(
+        `${deviceName} is a standalone camera with no HomeBase, so its local ` +
+          "recording index cannot be queried over P2P — eufy never returns a result " +
+          "for this command on solo cameras. Downloading by date range is not " +
+          "available for this device. Use eufy Cloud event history, or record going " +
+          "forward via the live stream."
+      );
+    }
+
     // Ensure the station is connected via P2P
     const stationConnected = await this.client!.isStationConnected(stationSN);
     if (!stationConnected) {
@@ -315,23 +371,28 @@ export class EufyService {
 
     const station = await this.client!.getStation(stationSN);
 
-    // databaseQueryLocal is event-based — wrap in a promise
+    // databaseQueryLocal is event-based — wrap in a promise.
+    //
+    // Two independent timeout layers are in play here, and this timer has to
+    // be the *longer* one or it masks the library's far more useful verdict:
+    //   * databaseQueryLocal only *enqueues* the command. The P2P session keeps
+    //     one un-acknowledged command in flight at a time, so this may sit in
+    //     the send queue for a while before it is even transmitted.
+    //   * only once the station ACKs does the library start its own
+    //     MAX_COMMAND_RESULT_WAIT (30s) result timer, and it reports the outcome
+    //     on "station command result" — a channel this code did not listen to.
+    // Since the library's clock starts at ACK, the old equal 30s app timer
+    // always fired first and reported a generic timeout for every distinct
+    // underlying cause.
     const records = await new Promise<DatabaseQueryLocal[]>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.client!.removeListener("station database query local", handler);
-        reject(new Error("Local database query timed out"));
-      }, LOCAL_QUERY_TIMEOUT_MS);
-
-      const handler = (
+      const onDatabaseResult = (
         eventStation: Station,
         returnCode: DatabaseReturnCode,
         data: DatabaseQueryLocal[]
       ) => {
         if (eventStation.getSerial() !== stationSN) return;
 
-        clearTimeout(timeout);
-        this.client!.removeListener("station database query local", handler);
-
+        cleanup();
         if (returnCode !== DatabaseReturnCode.SUCCESSFUL) {
           reject(new Error(`Local database query failed (code: ${returnCode})`));
           return;
@@ -339,23 +400,84 @@ export class EufyService {
         resolve(data);
       };
 
-      this.client!.on("station database query local", handler);
+      // Correlate on the command name the library stashes in customData, so an
+      // unrelated command timing out on the same station cannot fail this query.
+      const onCommandResult = (
+        eventStation: Station,
+        result: StationCommandResult
+      ) => {
+        if (eventStation.getSerial() !== stationSN) return;
+        if (result?.customData?.command?.name !== CommandName.StationDatabaseQueryLocal) {
+          return;
+        }
+        // This channel fires for successes too (return_code 0) — the actual
+        // result arrives on "station database query local". Only a non-zero code
+        // means the command itself failed, so ignore the success case here or we
+        // would reject every query that worked.
+        if (result.return_code === 0) return;
+
+        logger.warn(
+          { stationSN, returnCode: result.return_code },
+          "P2P layer reported a local database query failure"
+        );
+        cleanup();
+        reject(new Error(describeLocalQueryFailure(result.return_code)));
+      };
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        this.client!.removeListener("station database query local", onDatabaseResult);
+        this.client!.removeListener("station command result", onCommandResult);
+      };
+
+      const timeout = setTimeout(() => {
+        logger.error({ stationSN }, "Local database query produced no response at all");
+        cleanup();
+        reject(
+          new Error(
+            `Local database query timed out after ${
+              LOCAL_QUERY_TIMEOUT_MS / 1000
+            }s: the HomeBase neither acknowledged nor answered the request. It may ` +
+              "be offline, busy, or blocked behind another P2P command."
+          )
+        );
+      }, LOCAL_QUERY_TIMEOUT_MS);
+
+      this.client!.on("station database query local", onDatabaseResult);
+      this.client!.on("station command result", onCommandResult);
 
       logger.info(
         { stationSN, deviceSN: deviceSerialNumber, from: from.toISOString(), to: to.toISOString() },
         "Sending databaseQueryLocal command"
       );
-      station.databaseQueryLocal([deviceSerialNumber], from, to);
+
+      try {
+        station.databaseQueryLocal([deviceSerialNumber], from, to);
+      } catch (err) {
+        // Throws NotSupportedError when the station model does not implement the
+        // command. Surface that directly rather than hanging until the timeout.
+        cleanup();
+        reject(err as Error);
+      }
     });
 
     logger.info({ count: records.length }, "Local database query returned records");
 
+    // The station only filters at day granularity (it pins start_time to
+    // midnight and has no end_time field), so the requested window is not
+    // honoured on its own — re-filter here to avoid handing back events from
+    // outside the range the user actually asked for.
+    const fromSec = Math.trunc(from.getTime() / 1000);
+    const toSec = Math.trunc(to.getTime() / 1000);
+
     return records
-      .filter((r) => r.device_sn === deviceSerialNumber || !r.device_sn)
+      .filter(
+        (r) =>
+          (r.device_sn === deviceSerialNumber || !r.device_sn) &&
+          r.history != null
+      )
       .map((r) => {
         const h = r.history;
-        const startEpoch = Math.trunc(h.start_time.getTime() / 1000);
-        const endEpoch = Math.trunc(h.end_time.getTime() / 1000);
         return {
           id: `local_${r.record_id}`,
           deviceSerialNumber: r.device_sn ?? deviceSerialNumber,
@@ -364,13 +486,14 @@ export class EufyService {
           storagePath: h.storage_path,
           hevcStoragePath: "",
           cipherId: h.cipher_id,
-          startTime: startEpoch,
-          endTime: endEpoch,
+          startTime: Math.trunc(h.start_time.getTime() / 1000),
+          endTime: Math.trunc(h.end_time.getTime() / 1000),
           thumbPath: h.thumb_path,
           hasHuman: false,
           videoType: h.video_type as number,
         };
-      });
+      })
+      .filter((e) => e.endTime >= fromSec && e.startTime <= toSec);
   }
 
   async downloadEvent(event: EventRecord, outputPath: string): Promise<void> {
